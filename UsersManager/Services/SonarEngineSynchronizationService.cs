@@ -1,6 +1,7 @@
 ﻿using System.Security.Authentication;
 using System.Text;
 using IdentityModel.Client;
+using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -27,8 +28,9 @@ public class SonarEngineSynchronizationService : ISonarEngineSynchronizationServ
     
     private readonly HttpClient _httpClient;
     
+    private readonly SemaphoreSlim _lock = new(1, 1);
+    private readonly IDistributedCache _distributedCache;
     private SynchronizationStatus _synchronizationStatus;
-    private DateTime? _synchronizationSuccessDate;
     private List<string> _failedUsers;
     
     private readonly string _keycloakBaseUrl;
@@ -48,21 +50,21 @@ public class SonarEngineSynchronizationService : ISonarEngineSynchronizationServ
 	    ISonarEngineHelperService sonarEngineHelperService, 
 	    ISonarEngineUserManager sonarEngineUserManager, 
 	    IConfiguration configuration,  
-	    IServiceScopeFactory serviceScopeFactory)
+	    IServiceScopeFactory serviceScopeFactory, 
+	    IDistributedCache distributedCache)
     {
 	    _logger = logger;
 	    _accessService = accessService;
 	    _sonarEngineHelperService = sonarEngineHelperService;
 	    _sonarEngineUserManager = sonarEngineUserManager;
 	    _serviceScopeFactory = serviceScopeFactory;
-	    
+	    _distributedCache = distributedCache;
 
 	    var httpClientHandler = new HttpClientHandler();
 	    httpClientHandler.SslProtocols = SslProtocols.Tls13 | SslProtocols.Tls12;
 	    _httpClient = new HttpClient(httpClientHandler);
 	    
 	    _synchronizationStatus = SynchronizationStatus.Undone;
-	    _synchronizationSuccessDate = null;
 	    _failedUsers = new List<string>();
 
 	    _keycloakBaseUrl = configuration.GetValue<string>("keycloakClient:url") ?? 
@@ -145,18 +147,65 @@ public class SonarEngineSynchronizationService : ISonarEngineSynchronizationServ
         
         _failedUsers = _failedUsers.Distinct().ToList();
         if (_synchronizationStatus == SynchronizationStatus.Running)
-        {
-            _synchronizationStatus = SynchronizationStatus.Done;
-            _synchronizationSuccessDate = DateTime.UtcNow;
-        }
+	        _synchronizationStatus = SynchronizationStatus.Done;
+            
+        await SetSynchronizationState(tenantName, groupTenantList);
     }
     
-    public Task<GetSynchronizeStatusResponse> GetSynchronizationStatus()
-        => Task.FromResult(new GetSynchronizeStatusResponse(_synchronizationStatus, _synchronizationSuccessDate, _failedUsers));
+    public async Task<GetSynchronizeStatusResponse> GetSynchronizationStatus(string tenantName)
+    {
+        try
+        {
+            await _lock.WaitAsync();
+            var cacheKey = $"{tenantName}|usersSyncResult";
+            var cachedData = await _distributedCache.GetAsync(cacheKey);
+
+            if (cachedData is null) 
+    	        return new GetSynchronizeStatusResponse(SynchronizationStatus.Undone, null, new List<string>());
+            
+            var cachedString = Encoding.UTF8.GetString(cachedData);
+            return JsonConvert.DeserializeObject<GetSynchronizeStatusResponse>(cachedString);
+        }
+        finally
+        {
+            _lock.Release();
+        }
+    }
     
     #endregion
     
     #region Private Helpers 
+    
+    private async Task SetSynchronizationState(string? tenantName, List<KeycloakGroupDto> groupTenantList)
+    {
+	    var state = new GetSynchronizeStatusResponse(_synchronizationStatus, DateTime.UtcNow, _failedUsers);
+	        
+	    try
+	    {
+		    await _lock.WaitAsync();
+
+		    string cacheKey;
+		    if (tenantName is null)
+		    {
+			    foreach (var tenant in groupTenantList)
+			    {
+				    cacheKey = $"{tenant.Name}|usersSyncResult";
+				    await _distributedCache.RemoveAsync(cacheKey);
+				    await _distributedCache.SetAsync(cacheKey, Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(state, Formatting.Indented)));
+			    }
+
+			    return;
+		    }
+		        
+		    cacheKey = $"{tenantName}|usersSyncResult";
+		    await _distributedCache.RemoveAsync(cacheKey);
+		    await _distributedCache.SetAsync(cacheKey, Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(state, Formatting.Indented)));
+	    }
+	    finally
+	    {
+		    _lock.Release();
+	    }
+    }
     
     private async Task<List<KeycloakRoleDto>> GetKeycloakRolesList()
     {
